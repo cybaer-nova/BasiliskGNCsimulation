@@ -1,0 +1,55 @@
+{
+    "use_cases": {
+        "perturbCase": 2,
+        "thrusterCase": 1,
+        "controlCase": 1,
+        "number_of_satellites": 1
+    },
+    "fsw_settings": {
+        "sim_time":90.0,
+        "controller_type": "MRP",
+        "custom_controller_file": "None"
+    },
+    "sat_params": {
+        "ModelTag": "bskSat",
+        "mass": 100.0,
+        "center_of_mass": [[0.0], [0.0], [0.0]],
+        "inertia": [
+            [900.0, 0.0, 0.0],
+            [0.0, 800.0, 0.0],
+            [0.0, 0.0, 600.0]
+        ],
+        "initial_position":[[6878000.0], [0.0], [0.0]],
+        "initial_velocity":[[0.0], [7612.0], [0.0]],
+        "MRPs":[[0.05], [0.05], [-0.05]],
+        "angular_velocity":[[0.001], [-0.001], [0.001]],
+        "drag_projectedArea": 1.5,
+        "drag_dragCoeff": 2.0,
+        "srp_area": 1.5,
+        "srp_coefficientReflection": 1.2
+    },
+    "actuator_params": {
+        "d": 0.5,
+        "thruster_orient": {
+            "MaxThrust": 0.3,
+            "MinOnTime": 0.015,
+            "steadyIsp": 225.0,
+            "areaNozzle": 0.0001
+        },
+        "thruster_main": {
+            "MaxThrust": 10.0,
+            "MinOnTime": 0.01,
+            "steadyIsp": 235.0,
+            "areaNozzle": 0.07
+        },
+        "reaction_wheel": {
+            "mass": 12.0,
+            "Omega_max": 6000.0,
+            "Omega": 0.0,
+            "u_max": 5.0,
+            "u_min": 0.00001,
+            "maxMomentum": 50.0,
+            "fCoulomb": 0.0005
+        } 
+    }
+}
