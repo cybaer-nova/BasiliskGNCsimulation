@@ -1,116 +1,227 @@
 #==============================================================================#
 # File Name: RendezvousController.py
-# FSW Rendezvous Controller (Attitude Pointing + Main Engine Translation)
+# FSW Rendezvous Controller (Velocity Glide-Slope Architecture)
 #==============================================================================#
 
-from Basilisk.fswAlgorithms import mrpFeedback, locationPointing, attTrackingError, rwMotorTorque, thrFiringSchmitt
+from Basilisk.fswAlgorithms import mrpFeedback, attTrackingError, rwMotorTorque, thrFiringSchmitt
 from Basilisk.architecture import messaging
 from Basilisk.architecture import sysModel
 from Basilisk.utilities import macros
+from Basilisk.utilities import RigidBodyKinematics as rbk
 import math
+import numpy as np
 
-class ConditionalThrusterController(sysModel.SysModel):
+class RendezvousGuidanceController(sysModel.SysModel):
     """
-    Custom Python Flight Software (FSW) module running inside the simulation task loop.
-    Implements a safe 'Cruise Control' for orbital rendezvous by evaluating real-time
-    relative distance and closing velocity to command precise main engine pulses.
+    Flight Software module implementing orbital rendezvous guidance using 
+    Clohessy-Wiltshire relative dynamics and a velocity glide-slope architecture.
     """
-    def __init__(self, guidMsg, chaserTransMsg, chiefNavMsg, alignment_threshold):
-        super(ConditionalThrusterController, self).__init__()
-        self.guidMsg = guidMsg
+    def __init__(self, chaserTransMsg, chaserAttMsg, chiefNavMsg):
+        super(RendezvousGuidanceController, self).__init__()
+        
+        # Store input message handles for translation and attitude states
         self.chaserTransMsg = chaserTransMsg
-        self.chiefNavMsg = chiefNavMsg  # Direct NavTransMsg containing dynamic state and velocity
-        self.alignment_threshold = alignment_threshold
-        # Output message to send command force values to the Schmitt trigger modulator
+        self.chaserAttMsg = chaserAttMsg
+        self.chiefNavMsg = chiefNavMsg
+        
+        # Define output messages for attitude reference and thruster forces
+        self.attRefMsgOut = messaging.AttRefMsg()
         self.forceMsgOut = messaging.THRArrayCmdForceMsg()
+
+        # Spacecraft mass used for force-to-acceleration conversion
+        self.mass = 300.0  
+        
+        # Glide-slope and cruise control parameters
+        self.v_cruise_max = 1.0       # Maximum safe approach cruise velocity
+        self.braking_dist = 85.0      # Distance threshold where braking begins
+        self.Kv = 0.04                # Proportional velocity tracking gain
+        self.a_max = 0.035            # Maximum acceleration limit (~10.5 N) for clean pulses      
+        
+        self.b_z_prev = None
         
     def UpdateState(self, CurrentSimNanos):
-        # Read the current navigation and guidance states
-        guidData = self.guidMsg.read()
+        """
+        Periodic execution loop updating relative navigation, guidance, and control commands.
+        """
+        # Read current navigation and attitude data from input messages
         chaserData = self.chaserTransMsg.read()
+        chaserAttData = self.chaserAttMsg.read()
         chiefData = self.chiefNavMsg.read()
         
-        # 1. Compute the magnitude of the attitude pointing error vector (MRP norm)
-        mrp_error_norm = math.sqrt(guidData.sigma_BR[0]**2 + guidData.sigma_BR[1]**2 + guidData.sigma_BR[2]**2)
+        # Extract inertial position and velocity vectors for chief and chaser
+        r_c = np.array(chiefData.r_BN_N)
+        v_c = np.array(chiefData.v_BN_N)
+        r_s = np.array(chaserData.r_BN_N)
+        v_s = np.array(chaserData.v_BN_N)
         
-        # 2. Compute the Relative Position Vector (Target - Chaser) in Inertial Frame
-        rx = chiefData.r_BN_N[0] - chaserData.r_BN_N[0]
-        ry = chiefData.r_BN_N[1] - chaserData.r_BN_N[1]
-        rz = chiefData.r_BN_N[2] - chaserData.r_BN_N[2]
+        # Compute relative position and velocity vectors in the inertial frame
+        r_rel = r_s - r_c
+        v_rel = v_s - v_c
         
-        distance = math.sqrt(rx**2 + ry**2 + rz**2)
-        if distance < 0.0001: 
-            distance = 0.0001  # Guard against division by zero
+        # Guard against zero-division for chief radius magnitude
+        r_mag = np.linalg.norm(r_c)
+        if r_mag < 1.0: return
+        
+        # Compute orbital angular momentum vector and magnitude
+        h_vec = np.cross(r_c, v_c)
+        h_mag = np.linalg.norm(h_vec)
+        if h_mag < 1.0: return
+        
+        # Construct the Hill (Orbital) reference frame rotation matrix (R_HN)
+        i_r = r_c / r_mag                      
+        i_h = h_vec / h_mag                      
+        i_theta = np.cross(i_h, i_r)             
+        R_HN = np.vstack([i_r, i_theta, i_h])
+        
+        # Transform relative position into the Hill frame
+        r_H = R_HN @ r_rel
+        x, y, z = r_H[0], r_H[1], r_H[2]
+        
+        # Compute mean motion (n) and relative velocity in the Hill frame
+        n = h_mag / (r_mag**2) 
+        v_H = R_HN @ v_rel - np.array([-n * y, n * x, 0.0])
+        x_dot, y_dot, z_dot = v_H[0], v_H[1], v_H[2]
+        
+        dist_inertial = np.linalg.norm(r_rel)
+        
+        # 1. CRUISE CONTROL AND STATION-KEEPING LOGIC
+        target_dist = 10.0 
+        dist_to_go = dist_inertial - target_dist
+        
+        # Determine required velocity magnitude based on distance profile (Glide-slope)
+        if dist_to_go > self.braking_dist:
+            v_req_mag = self.v_cruise_max
+        elif dist_to_go > 0:
+            v_req_mag = (self.v_cruise_max / self.braking_dist) * dist_to_go
+        else:
+            v_req_mag = 0.05 * dist_to_go 
             
-        # 3. Compute the Relative Velocity Vector (Chaser - Target) in Inertial Frame
-        vx_c = chaserData.v_BN_N[0] - chiefData.v_BN_N[0]
-        vy_c = chaserData.v_BN_N[1] - chiefData.v_BN_N[1]
-        vz_c = chaserData.v_BN_N[2] - chiefData.v_BN_N[2]
+        # Compute the required velocity vector pointing toward the target
+        if dist_inertial > 0.1:
+            v_req_H = -(r_H / dist_inertial) * v_req_mag
+        else:
+            v_req_H = np.array([0.0, 0.0, 0.0])
+            
+        # Compute velocity error vector in the Hill frame
+        v_err_H = v_req_H - np.array([x_dot, y_dot, z_dot])
         
-        # 4. Compute Closing Speed by projecting relative velocity onto the Line of Sight (LOS)
-        # Positive values indicate that the Chaser is actively closing the gap to the Target
-        closing_speed = (vx_c * rx + vy_c * ry + vz_c * rz) / distance
+        # 2. SELF-LIMITED ACCELERATION CONTROL
+        a_ctrl_H = self.Kv * v_err_H
+        a_ctrl_mag = np.linalg.norm(a_ctrl_H)
         
-        payload = messaging.THRArrayCmdForceMsgPayload()
+        # Saturate control acceleration to maximum allowed limit
+        if a_ctrl_mag > self.a_max:
+            a_ctrl_H = a_ctrl_H * (self.a_max / a_ctrl_mag)
+            
+        # 3. GRAVITY COMPENSATION (Clohessy-Wiltshire Equations)
+        a_cw_x = 2.0 * n * y_dot + 3.0 * (n**2) * x
+        a_cw_y = -2.0 * n * x_dot
+        a_cw_z = -(n**2) * z
+        a_cw_H = np.array([a_cw_x, a_cw_y, a_cw_z])
         
-        # Pre-allocate a 36-element force array matching Basilisk's internal C++ vector capacity
+        # Combine control acceleration and gravity compensation, then convert to inertial force
+        a_total_H = a_ctrl_H - a_cw_H
+        F_N_raw = self.mass * (R_HN.T @ a_total_H)
+        F_mag = np.linalg.norm(F_N_raw)
+        
+        # 4. ATTITUDE MANAGEMENT WITH FREEZING AND RATE LIMITING
+        if F_mag > 0.01:
+            # Align pointing Z-axis with the required force vector when thrusters are active
+            b_z_target = F_N_raw / F_mag
+        else:
+            # Freeze attitude reference to the last valid position when engines are idle
+            b_z_target = self.b_z_prev if self.b_z_prev is not None else -r_rel / dist_inertial
+
+        # Apply a rate limiter to prevent abrupt attitude jumps
+        if self.b_z_prev is None:
+            b_z_req = b_z_target
+        else:
+            diff = b_z_target - self.b_z_prev
+            dist = np.linalg.norm(diff)
+            
+            max_step = 0.04  
+            if dist > max_step:
+                b_z_req = self.b_z_prev + (diff / dist) * max_step
+            else:
+                b_z_req = b_z_target
+
+        b_z_req = b_z_req / np.linalg.norm(b_z_req)
+        self.b_z_prev = b_z_req
+        
+        # 5. ORTHOGONAL REFERENCE FRAME CONSTRUCTION (R_RN)
+        ref_stable = i_h
+        b_y_req = np.cross(b_z_req, ref_stable)
+        if np.linalg.norm(b_y_req) < 1e-3:
+            ref_stable = i_r
+            b_y_req = np.cross(b_z_req, ref_stable)
+            
+        b_y_req = b_y_req / np.linalg.norm(b_y_req)
+        b_x_req = np.cross(b_y_req, b_z_req)
+        b_x_req = b_x_req / np.linalg.norm(b_x_req)
+        
+        R_RN = np.vstack([b_x_req, b_y_req, b_z_req])
+        
+        # Convert rotation matrix to Modified Rodrigues Parameters (MRPs)
+        try:
+            sigma_RN_array = rbk.C2MRP(R_RN)
+            sigma_RN = [0.0, 0.0, 0.0] if np.isnan(sigma_RN_array).any() else list(sigma_RN_array)
+        except:
+            sigma_RN = [0.0, 0.0, 0.0]
+        
+        # Populate and write the attitude reference message payload
+        refPayload = messaging.AttRefMsgPayload()
+        refPayload.sigma_RN = sigma_RN
+        omega_orb = n * i_h
+        refPayload.omega_RN_N = omega_orb.tolist()
+        refPayload.domega_RN_N = [0.0, 0.0, 0.0]
+        self.attRefMsgOut.write(refPayload, CurrentSimNanos)
+        
+        # 6. MAIN ENGINE TRANSLATION ACTUATION
+        sigma_BN = np.array(chaserAttData.sigma_BN)
+        sigma_BR = rbk.subMRP(sigma_BN, np.array(sigma_RN))
+        ang_error_deg = 4.0 * math.atan(np.linalg.norm(sigma_BR)) * (180.0 / math.pi)
+        
         thruster_forces = [0.0] * 36
         
-        # 5. Cruise Control Decision Logic:
-        # - Spaceship must be aligned within the threshold
-        # - Target must be further than a safe 10-meter boundary
-        if mrp_error_norm < self.alignment_threshold and distance > 10.0:
-            if closing_speed < 1.5:
-                # Command full engine force to overcome the Schmitt trigger level_on (30% of 500N)
-                thruster_forces[0] = 500.0
-                
-        # Write the force command list back to the C++ payload structure
-        payload.thrForce = thruster_forces
-        self.forceMsgOut.write(payload, CurrentSimNanos)
-
+        # Fire main engine only if attitude pointing error is within the alignment threshold
+        if ang_error_deg < 3.0 and not np.isnan(ang_error_deg):
+            thruster_forces[0] = min(F_mag, 15.0)
+            
+        # Write force command payload to the output message bus
+        forcePayload = messaging.THRArrayCmdForceMsgPayload()
+        forcePayload.thrForce = thruster_forces
+        self.forceMsgOut.write(forcePayload, CurrentSimNanos)
 
 def rendezvous_controller(scSim, fswTaskName, thrusterConfigMsg, rwConfigMsg, chaserTransMsg, chaserAttMsg, chiefTransMsg, vehConfigMsg, chiefNavMsg=None):
     """
-    FSW rendezvous controller: manages pointing attitude and controls closing velocity.
+    Configures and integrates the complete FSW guidance, attitude pointing, and translation loop.
     """
-    
-    # 1. POINTING REFERENCE (locationPointing)
-    # Align the spacecraft +Z axis with the dynamic location of the Target (Chief)
-    locPoint = locationPointing.locationPointing()
-    locPoint.ModelTag = "locPoint"
-    locPoint.scTransInMsg.subscribeTo(chaserTransMsg)
-    locPoint.scAttInMsg.subscribeTo(chaserAttMsg)
-    locPoint.locationInMsg.subscribeTo(chiefTransMsg) 
-    
-    # Set pointing axis to +Z in body frame to align the main engine thrust direction
-    locPoint.pHat_B = [0.0, 0.0, 1.0] 
-    scSim.AddModelToTask(fswTaskName, locPoint)
+    target_nav_msg = chiefNavMsg if chiefNavMsg is not None else chiefTransMsg
 
-    # 2. ATTITUDE TRACKING ERROR (attTrackingError)
-    # Evaluates the instantaneous angular deviation from the reference target pointing direction
+    # Instantiate and add the custom rendezvous guidance controller module
+    cwControl = RendezvousGuidanceController(chaserTransMsg, chaserAttMsg, target_nav_msg)
+    cwControl.ModelTag = "cwOrbitalMechanicsControl"
+    scSim.AddModelToTask(fswTaskName, cwControl)
+
+    # Configure attitude tracking error evaluation module
     attError = attTrackingError.attTrackingError()
     attError.ModelTag = "attError"
     attError.attNavInMsg.subscribeTo(chaserAttMsg)
-    attError.attRefInMsg.subscribeTo(locPoint.attRefOutMsg)
+    attError.attRefInMsg.subscribeTo(cwControl.attRefMsgOut)
     scSim.AddModelToTask(fswTaskName, attError)
 
-    # 3. ATTITUDE CONTROL LAW (mrpFeedback)
-    # Computes the 3D control torque required to damp attitude and tracking errors
+    # Configure MRP feedback attitude control loop
     mrpControl = mrpFeedback.mrpFeedback()
     mrpControl.ModelTag = "mrpFeedbackControl"
-    mrpControl.K = 5.5
-    
-    # Critically damped P gain to eliminate pointing oscillations
-    mrpControl.P = 150.0
-    
-    mrpControl.Ki = 0.0  # Integral gain disabled to prevent reaction wheel wind-up
-    mrpControl.integralLimit = 0.0
+    mrpControl.K = 12.0      
+    mrpControl.P = 30.0      
+    mrpControl.Ki = 0.001     
+    mrpControl.integralLimit = 0.5
     mrpControl.guidInMsg.subscribeTo(attError.attGuidOutMsg)
     mrpControl.vehConfigInMsg.subscribeTo(vehConfigMsg)
     scSim.AddModelToTask(fswTaskName, mrpControl)
 
-    # 4. REACTION WHEEL TORQUE MAPPING (rwMotorTorque)
-    # Maps the commanded 3D attitude control torque onto individual reaction wheel spin axes
+    # Configure reaction wheel torque mapping module
     rwTorque = rwMotorTorque.rwMotorTorque()
     rwTorque.ModelTag = "rwTorque"
     rwTorque.rwParamsInMsg.subscribeTo(rwConfigMsg)
@@ -118,33 +229,16 @@ def rendezvous_controller(scSim, fswTaskName, thrusterConfigMsg, rwConfigMsg, ch
     rwTorque.controlAxes_B = [1,0,0, 0,1,0, 0,0,1]
     scSim.AddModelToTask(fswTaskName, rwTorque)
 
-    # 5. TRANSLATION CONTROL (Main Engine Conditional Firing)
-    # We command thrust only when pointing error is within a safe 3.0-degree margin
-    alignment_threshold = 2.0 * math.tan(macros.D2R * 3.0 / 4.0) 
-    
-    # Pass target state navigation to the Python FSW cruise control module
-    target_nav_msg = chiefNavMsg if chiefNavMsg is not None else chiefTransMsg
-
-    # Instantiate the custom conditional firing module to handle translation thrust safety
-    condFiring = ConditionalThrusterController(attError.attGuidOutMsg, chaserTransMsg, target_nav_msg, alignment_threshold)
-    condFiring.ModelTag = "conditionalFiring"
-    scSim.AddModelToTask(fswTaskName, condFiring)
-
-    # Convert continuous thrust command signals into discrete valve timing (OnTime)
+    # Configure Schmitt trigger modulator for thruster pulse generation
     schmitt = thrFiringSchmitt.thrFiringSchmitt()
     schmitt.ModelTag = "mainThrusterSchmitt"
-    schmitt.thrMinFireTime = 0.025
-    schmitt.level_on = 0.3
-    schmitt.level_off = 0.1
-    
-    # Wire the modulator input to the output of our custom conditional thruster controller
-    schmitt.thrForceInMsg.subscribeTo(condFiring.forceMsgOut)
+    schmitt.thrMinFireTime = 0.1
+    schmitt.level_on = 0.05     
+    schmitt.level_off = 0.02
+    schmitt.thrForceInMsg.subscribeTo(cwControl.forceMsgOut)
     schmitt.thrConfInMsg.subscribeTo(thrusterConfigMsg)
-    
-    # Prevent Python's garbage collector from destroying the module during simulation steps
-    scSim.customCondFiringModule = condFiring 
-    
     scSim.AddModelToTask(fswTaskName, schmitt)
-
-    # Return commanded thruster valve timing and reaction wheel motor commands
-    return schmitt.onTimeOutMsg, rwTorque.rwMotorTorqueOutMsg
+    
+    # Store reference to prevent garbage collection
+    scSim.customCwControlModule = cwControl 
+    return schmitt.onTimeOutMsg, rwTorque.rwMotorTorqueOutMsg, attError
