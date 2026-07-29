@@ -67,6 +67,26 @@ class NavToGroundBridge(sysModel.SysModel):
 def run(perturbCase, thrusterCase, controlCase):
     """
     Simulation Executive Function handling configuration, orchestration, and execution.
+
+    Parameters
+    ----------
+    perturbCase : int (0 to 2)
+        Defines the level of environmental perturbations applied to the spacecraft:
+        - 0: Ideal spherical gravity of central celestial bodies (Earth, Sun, Moon, Jupiter, Mars).
+        - 1: Earth J2 geopotential harmonic perturbation + spherical gravity.
+        - 2: Full environmental perturbations (Earth J2 + Solar Radiation Pressure + Atmospheric Drag).
+
+    thrusterCase : int (0 to 2)
+        Defines the active hardware and actuator configuration:
+        - 0: 6 attitude control thrusters (2 opposing thrusters per body axis).
+        - 1: 3 Reaction Wheels for attitude control + 1 high-thrust main translational thruster.
+        - 2: 6 attitude control thrusters + 1 high-thrust main translational thruster.
+
+    controlCase : int (0 to 2)
+        Defines the active GNC control strategy:
+        - 0: Attitude Controller (Manages exclusively spatial reorientation using MRPs).
+        - 1: Rendezvous Controller (Manages proximity operations and docking relative to a chief satellite).
+        - 2: Relative Orbit & Formation Flying Controller (Maintains relative orbit configuration for multi-satellite fleets).
     """
     # Open the configuration file in read mode
     with open("Config.json", "r", encoding="utf-8") as file:
