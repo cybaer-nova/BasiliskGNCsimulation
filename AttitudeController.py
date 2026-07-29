@@ -4,7 +4,7 @@
 #==============================================================================#
 
  
-from Basilisk.fswAlgorithms import mrpFeedback, locationPointing, attTrackingError, thrForceMapping, thrFiringSchmitt, hillPoint
+from Basilisk.fswAlgorithms import mrpFeedback, attTrackingError, thrForceMapping, thrFiringSchmitt, hillPoint
 from Basilisk.architecture import messaging
 
 # Global list to store messages and prevent Python from deleting them from memory
@@ -46,14 +46,9 @@ def attitude_controller(scSim, fswTaskName, thrusterConfigMsg, navAttMsg, navTra
     # Correct message name is transNavInMsg, not transInMsg
     attRef.transNavInMsg.subscribeTo(navTransMsg)
     
-    # Define the body axis that should point towards the Earth center (Nadir)
-    # This aligns the +Y body axis with the nadir vector
-    # attRef.pHat_B = [0.0, 1.0, 0.0] 
-    
     scSim.AddModelToTask(fswTaskName, attRef)
 
     # 2. TRACKING ERROR (attTrackingError)
-    # Now it receives both orientation AND angular velocity
     attError = attTrackingError.attTrackingError()
     attError.ModelTag = "attError"
     attError.attNavInMsg.subscribeTo(navAttMsg)
@@ -84,7 +79,7 @@ def attitude_controller(scSim, fswTaskName, thrusterConfigMsg, navAttMsg, navTra
     thrMapping.vehConfigInMsg.subscribeTo(vehConfigMsg)
     scSim.AddModelToTask(fswTaskName, thrMapping)
 
-    # 5. SCHMITT TRIGGER (thrusterFiringSchmitt)
+    # 5. SCHMITT TRIGGER (thrFiringSchmitt)
     # Convert continuous thrust force requests into discrete on/off valve time commands (OnTime)
     schmitt = thrFiringSchmitt.thrFiringSchmitt()
     schmitt.ModelTag = "schmittTrigger"
